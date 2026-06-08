@@ -28,6 +28,9 @@ $cfg_rsn_path = "C:\ProgramData\Autodesk\Revit Server $cfg_rsn_version"
 $cfg_rsn_tool = "C:\Program Files\Autodesk\Revit Server $cfg_rsn_version\Tools\RevitServerToolCommand\RevitServerTool.exe"
 $cfg_aps_scopes = "data:read data:write data:create account:read"
 
+$cfg_max_dir_depth = 7
+$cfg_acc_base_folder = "00_WIP"
+
 # logging
 $cfg_rsn_logs = "$cfg_rsn_path\Logs\AutoBackup.log"
 $cfg_max_log_size_mb = 64
@@ -273,7 +276,7 @@ function New-APSStorage {
 function Send-APSFileToS3 {
 	<#
 	.SYNOPSIS
-		Pushes the local file bytes to the cloud using S3 Signed URL.
+		Pushes the local file bytes to the cloud using S3 Signed URL via strict .NET streams.
 	#>
 	param(
 		[Parameter(Mandatory=$true)][string]$StorageUrn,
@@ -281,7 +284,6 @@ function Send-APSFileToS3 {
 		[Parameter(Mandatory=$true)][string]$AccessToken
 	)
 
-	# extract bucket and object key from the URN (urn:adsk.objects:os.object:bucketName/objectKey)
 	if ($StorageUrn -match "urn:adsk.objects:os.object:(.+?)/(.+)$") {
 		$bucketKey = $matches[1]
 		$objectKey = $matches[2]
@@ -292,16 +294,47 @@ function Send-APSFileToS3 {
 
 	$authHeaders = @{ "Authorization" = "Bearer $AccessToken" }
 
+	# request Signed URL from Autodesk
 	try {
 		$urlGet = "https://developer.api.autodesk.com/oss/v2/buckets/$bucketKey/objects/$objectKey/signeds3upload"
 		$s3Response = Invoke-RestMethod -Uri $urlGet -Method Get -Headers $authHeaders -ErrorAction Stop
 		
 		$signedUrl = $s3Response.urls[0]
 		$uploadKey = $s3Response.uploadKey
+	} catch {
+		Write-Log "ERROR: [Step 1] Failed to get S3 signed URL. Details: $($_.Exception.Message)"
+		return $false
+	}
 
-		#Write-Log "INFO: Pushing physical bytes to the cloud..."
-		Invoke-RestMethod -Uri $signedUrl -Method Put -InFile $LocalFilePath -ErrorAction Stop | Out-Null
+	# stream directly to S3
+	try {
+		Add-Type -AssemblyName System.Net.Http | Out-Null		
+		$httpClient = [System.Net.Http.HttpClient]::new()
+		$httpClient.Timeout = [System.TimeSpan]::FromHours(2) # Prevent timeouts on massive RVT models
+		
+		$fileStream = [System.IO.File]::OpenRead($LocalFilePath)
+		$streamContent = [System.Net.Http.StreamContent]::new($fileStream)
+		
+		# strip the default Content-Type header to match S3 signature perfectly
+		$streamContent.Headers.Remove("Content-Type")
+		$response = $httpClient.PutAsync($signedUrl, $streamContent).GetAwaiter().GetResult()
+		
+		$fileStream.Close()
+		$streamContent.Dispose()
+		$httpClient.Dispose()
 
+		if (-not $response.IsSuccessStatusCode) {
+			Write-Log "ERROR: [Step 2] AWS S3 rejected upload. Status: $($response.StatusCode) - $($response.ReasonPhrase)"
+			return $false
+		}
+	} catch {
+		Write-Log "ERROR: [Step 2] Failed to stream file to S3. Details: $($_.Exception.Message)"
+		if ($fileStream) { $fileStream.Close() }
+		return $false
+	}
+
+	# notify acc that the upload is complete
+	try {
 		$urlComplete = "https://developer.api.autodesk.com/oss/v2/buckets/$bucketKey/objects/$objectKey/signeds3upload"
 		$bodyComplete = @{ "uploadKey" = $uploadKey } | ConvertTo-Json
 		
@@ -313,7 +346,7 @@ function Send-APSFileToS3 {
 		Invoke-RestMethod -Uri $urlComplete -Method Post -Headers $headersComplete -Body $bodyComplete -ErrorAction Stop | Out-Null
 		return $true
 	} catch {
-		Write-Log "ERROR: Failed to upload file to S3. Details: $($_.Exception.Message)"
+		Write-Log "ERROR: [Step 3] Failed to complete upload with Autodesk OSS. Details: $($_.Exception.Message)"
 		return $false
 	}
 }
@@ -463,86 +496,95 @@ foreach ($projectFolder in $projectFolders) {
 		continue # Skip to the next project
 	}
 
-	# retrieve disciplines/role folders
+	# dynamically search for any ".RVT" folders up to the max depth limit
 	try {
-		$disciplineFolders = Get-ChildItem -Path $projectFolder.FullName -Directory -ErrorAction Stop
+		$rvtDirs = Get-ChildItem -Path $projectFolder.FullName -Filter "RVT" -Directory -Recurse -Depth $cfg_max_dir_depth -ErrorAction Stop
 	} catch {
-		Write-Log "ERROR: Failed to retrieve discipline folders for $($projectFolder.Name). Details: $($_.Exception.Message)"
-		continue # skip to the next project
+		Write-Log "ERROR: Failed to scan directory tree for $($projectFolder.Name). Details: $($_.Exception.Message)"
+		continue
 	}
 
-	foreach ($disciplineFolder in $disciplineFolders) {
+	if ($rvtDirs.Count -eq 0) {
+		Write-Log "WARNING: No RVT folders found in $($projectFolder.Name) up to depth $cfg_max_dir_depth. Skipping."
+		continue
+	}
+
+	# process found folders
+	foreach ($rvtDir in $rvtDirs) {
+		$relativePath = $rvtDir.FullName.Substring($projectFolder.FullName.Length).Trim('\')
+		$pathNodes = $relativePath -split '\\'
+
+		# retrieve Revit models inside this specific RVT folder
 		try {
-			$stageFolders = Get-ChildItem -Path $disciplineFolder.FullName -Directory -ErrorAction Stop
+			$rvtFolders = @(Get-ChildItem -Path $rvtDir.FullName -Filter "*.rvt" -Directory -ErrorAction Stop)
+			$numRvtFound += $rvtFolders.Count
 		} catch {
-			Write-Log "ERROR: Failed to retrieve stage folders for $($projectFolder.Name)\$($disciplineFolder.Name). Details: $($_.Exception.Message)"
-			continue # skip to the next discipline
+			Write-Log "ERROR: Failed to retrieve revit models in $relativePath. Details: $($_.Exception.Message)"
+			continue
 		}
 
-		foreach ($stageFolder in $stageFolders) {
-			$pathRvtDir = Join-Path -Path $stageFolder.FullName -ChildPath "RVT"
-			# try to retrieve .rvt folder containers
-			if (Test-Path -Path $pathRvtDir -PathType Container) {
-				try {
-					$rvtFolders = @(Get-ChildItem -Path $pathRvtDir -Filter "*.rvt" -Directory -Recurse -ErrorAction Stop)
-					$numRvtFound += $rvtFolders.Count
-				} catch {
-					Write-Log "ERROR: Failed to retrieve revit model folders for $($projectFolder.Name)\$($disciplineFolder.Name)\$($stageFolder.Name). Details: $($_.Exception.Message)"
-					continue
-				}
-				# make revit backup files
-				foreach ($rvt in $rvtFolders) {
-					$pathModel = $rvt.FullName.Substring($pathProjects.Length).Trim('\')
-					$destModelFile = Join-Path -Path $pathBackupProject -ChildPath $rvt.Name
-					Write-Log "INFO: Backup started for '$pathModel'..."
-					# execute backup tool
-					$toolOutput = & $cfg_rsn_tool createLocalRvt $pathModel -s $cfg_rsn_name -d $destModelFile -o 2>&1
-					$isSuccess = $toolOutput | Select-String -Pattern "successfully created" -Quiet -CaseSensitive:$false
+		$accChecked = $false
+		$targetFolderUrn = $null
 
-					if ($isSuccess) {
-						$numRvtBackedUp++
-						Write-Log "DONE: Backup successfully created. Uploading..."
-						if ($accProject) {
-							$dmHubId = "b.$cfg_acc_account_id"
-							$dmProjectId = "b.$($accProject.id)"
-							# retrieve forma dir tree
-							$targetFolderUrn = Get-APSTopFolder -HubId $dmHubId -ProjectId $dmProjectId -FolderName "Project Files" -AccessToken $globalToken
-							if ($targetFolderUrn) { $targetFolderUrn = Get-APSChildFolder -ProjectId $dmProjectId -ParentFolderId $targetFolderUrn -FolderName "00_WIP" -AccessToken $globalToken }
-							if ($targetFolderUrn) { $targetFolderUrn = Get-APSChildFolder -ProjectId $dmProjectId -ParentFolderId $targetFolderUrn -FolderName $disciplineFolder.Name -AccessToken $globalToken }
-							if ($targetFolderUrn) { $targetFolderUrn = Get-APSChildFolder -ProjectId $dmProjectId -ParentFolderId $targetFolderUrn -FolderName $stageFolder.Name -AccessToken $globalToken }
-							if ($targetFolderUrn) { $targetFolderUrn = Get-APSChildFolder -ProjectId $dmProjectId -ParentFolderId $targetFolderUrn -FolderName "RVT" -AccessToken $globalToken }
+		# process revit model folders
+		foreach ($rvt in $rvtFolders) {			
+			$pathModel = $rvt.FullName.Substring($pathProjects.Length).Trim('\')			
+			$destModelFile = Join-Path -Path $pathBackupProject -ChildPath $rvt.Name
+			
+			Write-Log "INFO: Backup started for '$pathModel'..."
 
+			$toolOutput = & $cfg_rsn_tool createLocalRvt $pathModel -s $cfg_rsn_name -d $destModelFile -o 2>&1
+			$isSuccess = $toolOutput | Select-String -Pattern "successfully created" -Quiet -CaseSensitive:$false
+
+			if ($isSuccess) {
+				$numRvtBackedUp++
+				Write-Log "DONE: Backup successfully created locally. Preparing to upload..."
+
+				if (-not $accChecked) {
+					$accChecked = $true
+					if ($accProject) {
+						#Write-Log "INFO: Checking ACC folder correspondence for '$relativePath'..."
+						$dmHubId = "b.$cfg_acc_account_id"
+						$dmProjectId = "b.$($accProject.id)"
+						
+						$targetFolderUrn = Get-APSTopFolder -HubId $dmHubId -ProjectId $dmProjectId -FolderName "Project Files" -AccessToken $globalToken
+						if ($targetFolderUrn -and $cfg_acc_base_folder) { 
+							$targetFolderUrn = Get-APSChildFolder -ProjectId $dmProjectId -ParentFolderId $targetFolderUrn -FolderName $cfg_acc_base_folder -AccessToken $globalToken 
+						}
+						
+						# drill down matching the local relative path
+						foreach ($node in $pathNodes) {
 							if ($targetFolderUrn) {
-								#Write-Log "DONE: Full cloud path verified! Target URN: $targetFolderUrn"
-								$storageUrn = New-APSStorage -ProjectId $dmProjectId -FolderUrn $targetFolderUrn -FileName $rvt.Name -AccessToken $globalToken
-								if ($storageUrn) {
-									$isUploaded = Send-APSFileToS3 -StorageUrn $storageUrn -LocalFilePath $destModelFile -AccessToken $globalToken
-									if ($isUploaded) {
-										$publishedId = Publish-APSDocument -ProjectId $dmProjectId -FolderUrn $targetFolderUrn -StorageUrn $storageUrn -FileName $rvt.Name -AccessToken $globalToken
-										if ($publishedId) {
-											$numRvtUploaded++
-										}
-									} else {
-										Write-Log "ERROR: Something went wrong while uploading."
-									}
-								}
+								$targetFolderUrn = Get-APSChildFolder -ProjectId $dmProjectId -ParentFolderId $targetFolderUrn -FolderName $node -AccessToken $globalToken
 							} else {
-								Write-Log "WARNING: Could not verify ACC folder tree. Skipping upload."
+								break # missing / not matching
+							}
+						}
+					}
+				}
+
+				# upload if the acc cloud path is valid
+				if ($targetFolderUrn) {
+					$storageUrn = New-APSStorage -ProjectId $dmProjectId -FolderUrn $targetFolderUrn -FileName $rvt.Name -AccessToken $globalToken
+					if ($storageUrn) {
+						$isUploaded = Send-APSFileToS3 -StorageUrn $storageUrn -LocalFilePath $destModelFile -AccessToken $globalToken
+						if ($isUploaded) {
+							$publishedId = Publish-APSDocument -ProjectId $dmProjectId -FolderUrn $targetFolderUrn -StorageUrn $storageUrn -FileName $rvt.Name -AccessToken $globalToken
+							if ($publishedId) {
+								$numRvtUploaded++
 							}
 						} else {
-							Write-Log "WARNING: Could not find matching ACC project for '$projectKey'. Skipping upload."
+							Write-Log "ERROR: Something went wrong while uploading to the cloud"
 						}
-
-					} else {
-						$errorMsg = $toolOutput -join " | "
-						Write-Log "ERROR: Backup failed. Details: $errorMsg"
 					}
-
+				} else {
+					Write-Log "WARNING: The path '$relativePath' is not found in the cloud. Skipping uploading."
 				}
-			} else {
-				Write-Log "WARNING: No RVT folder in $($projectFolder.Name)\$($disciplineFolder.Name)\$($stageFolder.Name). Skipping."
-			}
 
+			} else {
+				$errorMsg = $toolOutput -join " | "
+				Write-Log "ERROR: Backup failed. Details: $errorMsg"
+			}
 
 		}
 
