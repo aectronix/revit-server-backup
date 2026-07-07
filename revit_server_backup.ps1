@@ -27,9 +27,7 @@ foreach ($line in Get-Content -Path $envPath) {
 $cfg_rsn_path = "C:\ProgramData\Autodesk\Revit Server $cfg_rsn_version"
 $cfg_rsn_tool = "C:\Program Files\Autodesk\Revit Server $cfg_rsn_version\Tools\RevitServerToolCommand\RevitServerTool.exe"
 $cfg_aps_scopes = "data:read data:write data:create account:read"
-
 $cfg_max_dir_depth = 7
-$cfg_acc_base_folder = "00_WIP"
 
 # logging
 $cfg_rsn_logs = "$cfg_rsn_path\Logs\AutoBackup.log"
@@ -212,7 +210,6 @@ function Get-APSChildFolder {
 
 	$url = "https://developer.api.autodesk.com/data/v1/projects/$ProjectId/folders/$ParentFolderId/contents?filter[type]=folders"
 	$headers = @{ "Authorization" = "Bearer $AccessToken" }
-
 	try {
 		$response = Invoke-RestMethod -Uri $url -Method Get -Headers $headers -ErrorAction Stop
 		$targetFolder = $response.data | Where-Object { $_.attributes.name -eq $FolderName }
@@ -546,11 +543,7 @@ foreach ($projectFolder in $projectFolders) {
 						#Write-Log "INFO: Checking ACC folder correspondence for '$relativePath'..."
 						$dmHubId = "b.$cfg_acc_account_id"
 						$dmProjectId = "b.$($accProject.id)"
-						
 						$targetFolderUrn = Get-APSTopFolder -HubId $dmHubId -ProjectId $dmProjectId -FolderName "Project Files" -AccessToken $globalToken
-						if ($targetFolderUrn -and $cfg_acc_base_folder) { 
-							$targetFolderUrn = Get-APSChildFolder -ProjectId $dmProjectId -ParentFolderId $targetFolderUrn -FolderName $cfg_acc_base_folder -AccessToken $globalToken 
-						}
 						
 						# drill down matching the local relative path
 						foreach ($node in $pathNodes) {
